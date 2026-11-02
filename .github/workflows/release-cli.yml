@@ -115,19 +115,24 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+      # actions/attest writes SLSA build provenance when it gets no SBOM and no predicate. The
+      # attest-build-provenance and attest-sbom wrappers are deprecated in its favor.
       - name: Attest build provenance for the archives
         if: ${{ !inputs.sign-only }}
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: ${{ steps.subjects.outputs.paths }}
 
+      # A storage record links the image to an org artifact inventory, which ipso does not use, and
+      # it would need artifact-metadata: write. Without it the attestation is the same.
       - name: Attest build provenance for the image
         if: ${{ !inputs.sign-only }}
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ghcr.io/ipsofacto-io/ipso
           subject-digest: ${{ steps.image.outputs.digest }}
           push-to-registry: true
+          create-storage-record: false
 
       - name: Install Syft
         run: |
@@ -152,26 +157,27 @@ jobs:
           mkdir -p sbom
           module="sbom/ipso_${version}_sbom.cdx.json"
           image="sbom/ipso_${version}_image.cdx.json"
-          syft "dir:." --exclude "./dist/**" -o "cyclonedx-json=${module}"
+          syft "dir:." --exclude "./dist/**" --source-name ipso --source-version "${version}" -o "cyclonedx-json=${module}"
           syft "ghcr.io/ipsofacto-io/ipso@${{ steps.image.outputs.digest }}" -o "cyclonedx-json=${image}"
           echo "module=${module}" >> "$GITHUB_OUTPUT"
           echo "image=${image}" >> "$GITHUB_OUTPUT"
 
       - name: Attest the module SBOM
         if: ${{ !inputs.sign-only }}
-        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: ${{ steps.subjects.outputs.paths }}
           sbom-path: ${{ steps.sbom.outputs.module }}
 
       - name: Attest the image SBOM
         if: ${{ !inputs.sign-only }}
-        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ghcr.io/ipsofacto-io/ipso
           subject-digest: ${{ steps.image.outputs.digest }}
           sbom-path: ${{ steps.sbom.outputs.image }}
           push-to-registry: true
+          create-storage-record: false
 
       - name: Install cosign
         run: |
