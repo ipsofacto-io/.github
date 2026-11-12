@@ -21,16 +21,18 @@ on:
         default: false
 
 permissions:
-  contents: write
-  packages: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
   release:
     name: release / supply-chain
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
     env:
       TAG: ${{ inputs.tag }}
       SIGN_ONLY: ${{ inputs.sign-only }}
