@@ -2,6 +2,8 @@
 """Check .well-known/security.txt (RFC 9116) against SECURITY.md.
 
 Run from anywhere: the files are read relative to the repository root.
+The file must be printable ASCII on every line, comments included, because parsers disagree on which
+characters end a line, and a comment must not be able to hide a field from one of them.
 The weekly workflow fails when Expires is less than 30 days away, so a person renews the file in time.
 """
 import re
@@ -25,7 +27,7 @@ RFC3339 = re.compile(
     re.ASCII,
 )
 LANGUAGE_TAG = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$")
-URL = re.compile(r"https://[^\s)\]>\"'`<]+")
+LINK_TARGET = re.compile(r"\]\((https://[^\s)]+)\)")
 
 
 def parse_expires(value):
@@ -58,6 +60,9 @@ def check(text, security_md, now):
     # RFC 9116 ends a line at LF or CRLF only. str.splitlines() also splits on other characters.
     for number, raw in enumerate(text.split("\n"), start=1):
         line = raw.rstrip("\r")
+        if any(ch != "\t" and not " " <= ch <= "~" for ch in line):
+            errors.append(f"line {number}: contains a character that is not printable ASCII")
+            continue
         if not line.strip() or line.startswith("#"):
             continue
         match = FIELD_LINE.match(line)
@@ -72,8 +77,8 @@ def check(text, security_md, now):
 
     if values.get("contact", []) != [CONTACT]:
         errors.append(f"Contact must be exactly one line: {CONTACT}")
-    elif CONTACT not in set(URL.findall(security_md)):
-        errors.append(f"SECURITY.md does not name the Contact URL: {CONTACT}")
+    elif CONTACT not in set(LINK_TARGET.findall(security_md)):
+        errors.append(f"SECURITY.md does not link to the Contact URL: {CONTACT}")
 
     expires = values.get("expires", [])
     if len(expires) != 1:

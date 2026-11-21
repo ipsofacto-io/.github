@@ -18,6 +18,12 @@ VALID = "\n".join(
     ]
 )
 
+# Built with chr() so this file stays plain ASCII.
+LINE_SEPARATORS = [chr(code) for code in (0x2028, 0x2029, 0x85, 0x0B, 0x0C, 0x1C, 0x1D, 0x1E)]
+ARABIC_INDIC_2027 = "".join(chr(code) for code in (0x662, 0x660, 0x662, 0x667))
+NO_BREAK_SPACE = chr(0xA0)
+BYTE_ORDER_MARK = chr(0xFEFF)
+
 
 def replace(old, new):
     assert old in VALID
@@ -50,13 +56,21 @@ class CheckSecurityTxt(unittest.TestCase):
         self.assertOneError(VALID + "Contact: mailto:security@ipsoplatform.io\n", "Contact must be")
 
     def test_contact_not_in_security_md(self):
-        self.assertOneError(VALID, "SECURITY.md does not name", security_md="no contact here\n")
+        self.assertOneError(VALID, "SECURITY.md does not link to", security_md="no contact here\n")
 
     def test_contact_url_prefix_in_security_md_is_not_enough(self):
-        self.assertOneError(VALID, "SECURITY.md does not name", security_md=f"see {CONTACT}/extra\n")
+        self.assertOneError(VALID, "SECURITY.md does not link to", security_md=f"see [x]({CONTACT}/extra)\n")
 
-    def test_contact_in_security_md_inside_backticks(self):
-        self.assertEqual(self.errors(VALID, security_md=f"use `{CONTACT}` to report\n"), [])
+    def test_contact_only_in_backticks_is_not_a_link(self):
+        self.assertOneError(VALID, "SECURITY.md does not link to", security_md=f"use `{CONTACT}` to report\n")
+
+    def test_contact_as_bare_text_is_not_a_link(self):
+        self.assertOneError(VALID, "SECURITY.md does not link to", security_md=f"report at {CONTACT}\n")
+
+    def test_contact_as_link_text_with_another_target(self):
+        self.assertOneError(
+            VALID, "SECURITY.md does not link to", security_md=f"[{CONTACT}](https://attacker.example/report)\n"
+        )
 
     def test_missing_expires(self):
         self.assertOneError(replace("Expires: 2027-11-20T23:00:00Z\n", ""), "exactly one Expires")
@@ -100,7 +114,8 @@ class CheckSecurityTxt(unittest.TestCase):
         self.assertOneError(replace("2027-11-20T23:00:00Z", "2027-11-20T23:59:61Z"), "RFC 3339")
 
     def test_expires_non_ascii_digits(self):
-        self.assertOneError(replace("2027-11-20", "٢٠٢٧-11-20"), "RFC 3339")
+        errors = self.errors(replace("2027-11-20", ARABIC_INDIC_2027 + "-11-20"))
+        self.assertTrue(any("printable ASCII" in error for error in errors), errors)
 
     def test_unknown_field(self):
         self.assertOneError(VALID + "Bounty: https://example.com\n", "Bounty is not allowed")
@@ -116,9 +131,26 @@ class CheckSecurityTxt(unittest.TestCase):
     def test_signed_file_is_refused(self):
         self.assertTrue(self.errors("-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\n" + VALID))
 
-    def test_unicode_line_separator_is_not_a_line_break(self):
-        text = replace("Preferred-Languages: en, it", "Preferred-Languages: en, it Hiring: https://x.example")
-        self.assertTrue(self.errors(text))
+    def test_line_separator_characters_are_refused_in_a_field(self):
+        for separator in LINE_SEPARATORS:
+            with self.subTest(separator=hex(ord(separator))):
+                text = replace("Preferred-Languages: en, it", f"Preferred-Languages: en, it{separator}Hiring: https://x.example")
+                self.assertOneError(text, "printable ASCII")
+
+    def test_line_separator_characters_cannot_hide_a_field_in_a_comment(self):
+        for separator in LINE_SEPARATORS:
+            with self.subTest(separator=hex(ord(separator))):
+                text = replace("# comment", f"# comment{separator}Encryption: https://attacker.example/key.asc")
+                self.assertOneError(text, "printable ASCII")
+
+    def test_non_ascii_blank_line_is_refused(self):
+        self.assertOneError(VALID + NO_BREAK_SPACE + "\n", "printable ASCII")
+
+    def test_byte_order_mark_is_refused(self):
+        self.assertOneError(BYTE_ORDER_MARK + VALID, "printable ASCII")
+
+    def test_bare_carriage_return_inside_a_line_is_refused(self):
+        self.assertOneError(replace("# comment", "# com\rment"), "printable ASCII")
 
     def test_http_canonical(self):
         text = replace(cst.CANONICAL, "http://ipsoplatform.io/.well-known/security.txt")
