@@ -1,5 +1,7 @@
+import tempfile
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 
 import check_security_txt as cst
 
@@ -71,6 +73,39 @@ class CheckSecurityTxt(unittest.TestCase):
         self.assertOneError(
             VALID, "SECURITY.md does not link to", security_md=f"[{CONTACT}](https://attacker.example/report)\n"
         )
+
+    def test_contact_link_inside_html_comment_does_not_count(self):
+        self.assertOneError(VALID, "SECURITY.md does not link to", security_md=f"<!-- [x]({CONTACT}) -->\n")
+
+    def test_contact_link_inside_unclosed_html_comment_does_not_count(self):
+        self.assertOneError(VALID, "SECURITY.md does not link to", security_md=f"<!-- [x]({CONTACT})\n")
+
+    def test_contact_link_inside_code_span_does_not_count(self):
+        self.assertOneError(VALID, "SECURITY.md does not link to", security_md=f"`[x]({CONTACT})`\n")
+
+    def test_contact_link_inside_double_backtick_span_does_not_count(self):
+        self.assertOneError(VALID, "SECURITY.md does not link to", security_md=f"``[x]({CONTACT})``\n")
+
+    def test_contact_link_inside_fenced_block_does_not_count(self):
+        for fence in ("```", "~~~"):
+            with self.subTest(fence=fence):
+                md = f"{fence}sh\n[x]({CONTACT})\n{fence}\n"
+                self.assertOneError(VALID, "SECURITY.md does not link to", security_md=md)
+
+    def test_contact_link_inside_unclosed_fence_does_not_count(self):
+        self.assertOneError(VALID, "SECURITY.md does not link to", security_md=f"```\n[x]({CONTACT})\n")
+
+    def test_link_after_a_code_block_still_counts(self):
+        md = f"```sh\necho hi\n```\n\nReport in [ipso]({CONTACT}).\n"
+        self.assertEqual(self.errors(VALID, security_md=md), [])
+
+    def test_link_after_a_comment_still_counts(self):
+        md = f"<!-- note -->\nReport in [ipso]({CONTACT}).\n"
+        self.assertEqual(self.errors(VALID, security_md=md), [])
+
+    def test_link_between_two_code_spans_still_counts(self):
+        md = f"`a` then [ipso]({CONTACT}) then `b`\n"
+        self.assertEqual(self.errors(VALID, security_md=md), [])
 
     def test_missing_expires(self):
         self.assertOneError(replace("Expires: 2027-11-20T23:00:00Z\n", ""), "exactly one Expires")
@@ -152,6 +187,15 @@ class CheckSecurityTxt(unittest.TestCase):
     def test_bare_carriage_return_inside_a_line_is_refused(self):
         self.assertOneError(replace("# comment", "# com\rment"), "printable ASCII")
 
+    def test_tab_is_refused(self):
+        self.assertOneError(replace("en, it", "en,\tit"), "printable ASCII")
+
+    def test_two_carriage_returns_at_a_line_end_are_refused(self):
+        self.assertOneError(replace("# comment", "# comment\r\r"), "printable ASCII")
+
+    def test_carriage_return_at_the_end_of_the_file_is_refused(self):
+        self.assertOneError(VALID + "# end\r", "printable ASCII")
+
     def test_http_canonical(self):
         text = replace(cst.CANONICAL, "http://ipsoplatform.io/.well-known/security.txt")
         self.assertOneError(text, "Canonical must be")
@@ -175,6 +219,43 @@ class CheckSecurityTxt(unittest.TestCase):
 
     def test_field_names_are_case_insensitive(self):
         self.assertEqual(self.errors(replace("Contact:", "contact:")), [])
+
+
+class RunThroughFiles(unittest.TestCase):
+    """Go through run(), which reads the file as bytes, as main() does."""
+
+    def run_with(self, content, security_md=SECURITY_MD):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".well-known").mkdir()
+            (root / ".well-known" / "security.txt").write_bytes(content)
+            (root / "SECURITY.md").write_text(security_md, encoding="utf-8")
+            return cst.run(root, NOW)
+
+    def assertRefused(self, content):
+        errors = self.run_with(content)
+        self.assertTrue(any("printable ASCII" in error for error in errors), errors)
+
+    def test_valid_file(self):
+        self.assertEqual(self.run_with(VALID.encode("ascii")), [])
+
+    def test_crlf_file_is_valid(self):
+        self.assertEqual(self.run_with(VALID.replace("\n", "\r\n").encode("ascii")), [])
+
+    def test_lone_cr_line_endings_are_refused(self):
+        self.assertRefused(VALID.replace("\n", "\r").encode("ascii"))
+
+    def test_lone_cr_hiding_a_field_after_a_comment_is_refused(self):
+        self.assertRefused(replace("# comment", "# comment\rEncryption: https://attacker.example/key.asc").encode("ascii"))
+
+    def test_byte_order_mark_bytes_are_refused(self):
+        self.assertRefused(bytes([0xEF, 0xBB, 0xBF]) + VALID.encode("ascii"))
+
+    def test_utf8_bytes_are_refused(self):
+        self.assertRefused(replace("# comment", "# caf").encode("ascii") + chr(0xE9).encode("utf-8"))
+
+    def test_line_separator_bytes_are_refused(self):
+        self.assertRefused(replace("# comment", "# comment" + chr(0x2028)).encode("utf-8"))
 
 
 if __name__ == "__main__":
