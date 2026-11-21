@@ -8,13 +8,13 @@ Do not open public issues, discussions or pull requests for security problems.
 
 Where you can, include the affected repository and version or commit, a description of the issue and its impact, steps to reproduce or a proof of concept, and any known mitigation.
 
-Reports stay private to the maintainers. We do not copy a reporter's name, email address or report text into public pages, issue trackers or regulator filings.
+Reports stay private to the maintainers. We do not copy a reporter's name or email address into public pages, issue trackers or regulator filings. GitHub builds the draft advisory from your report, so before publication we rewrite it to carry the impact and the fix, and not your proof of concept or personal details, unless you agree otherwise.
 
 ## What to expect
 
 - We acknowledge reports within 5 business days.
 - We keep you informed while we investigate and fix the issue.
-- We agree a disclosure date with you, inside the window described below.
+- We agree a disclosure date with you, as described below.
 - Fixes are published as GitHub security advisories, with a CVE where applicable.
 - We credit you in the advisory through GitHub's credits field if you accept the credit. Without your acceptance we do not name you.
 
@@ -24,7 +24,7 @@ This is our coordinated vulnerability disclosure (CVD) policy. The disclosure wi
 
 - **Fix first.** We aim to ship a fix and publish the advisory before day 90. The advisory is published when the fix is released.
 - **Day 90.** If no fix has shipped by day 90, we publish the advisory with the mitigations we know, unless we agreed a later date with you in the private advisory. We agree a later date only while a fix is in progress.
-- **Your side.** Keep the details private until the advisory is published or day 90 passes, whichever comes first.
+- **Your side.** Keep the details private until the advisory is published or the disclosure date passes. The disclosure date is day 90, or the later date we agreed with you.
 - **Actively exploited issues.** If an issue is being exploited in the wild, either side may publish earlier after telling the other.
 - **Third-party components.** When the flaw is in a component we use, we also report it to the maintainers of that component, and we may agree a different date with them.
 - **What we publish.** The advisory names the repository, the affected version, the impact and the update. It does not name you unless you accepted credit.
