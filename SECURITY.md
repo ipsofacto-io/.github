@@ -2,17 +2,41 @@
 
 ## Reporting a vulnerability
 
-Report vulnerabilities privately through GitHub private vulnerability reporting: open the **Security** tab of the affected repository and choose **Report a vulnerability**, or go to `https://github.com/ipsofacto-io/<repository>/security/advisories/new`. If you are unsure which repository is affected, report it in [ipso](https://github.com/ipsofacto-io/ipso/security/advisories/new).
+Report vulnerabilities privately through GitHub private vulnerability reporting: open the **Security** tab of the affected repository and choose **Report a vulnerability**, or go to `https://github.com/ipsofacto-io/<repository>/security/advisories/new`. If you are unsure which repository is affected, or the affected repository is private (for example `ipso-ee`), report it in [ipso](https://github.com/ipsofacto-io/ipso/security/advisories/new).
 
 Do not open public issues, discussions or pull requests for security problems.
 
 Where you can, include the affected repository and version or commit, a description of the issue and its impact, steps to reproduce or a proof of concept, and any known mitigation.
 
+Reports stay private to the maintainers. We do not copy a reporter's name, email address or report text into public pages, issue trackers or regulator filings.
+
 ## What to expect
 
 - We acknowledge reports within 5 business days.
-- We keep you informed while we investigate and fix the issue, agree on a disclosure date with you, and credit you in the advisory unless you prefer otherwise.
+- We keep you informed while we investigate and fix the issue.
+- We agree a disclosure date with you, inside the window described below.
 - Fixes are published as GitHub security advisories, with a CVE where applicable.
+- We credit you in the advisory through GitHub's credits field if you accept the credit. Without your acceptance we do not name you.
+
+## Coordinated vulnerability disclosure
+
+This is our coordinated vulnerability disclosure (CVD) policy. The disclosure window is 90 days, counted from the day we receive the report.
+
+- **Fix first.** We aim to ship a fix and publish the advisory before day 90. The advisory is published when the fix is released.
+- **Day 90.** If no fix has shipped by day 90, we publish the advisory with the mitigations we know, unless we agreed a later date with you in the private advisory. We agree a later date only while a fix is in progress.
+- **Your side.** Keep the details private until the advisory is published or day 90 passes, whichever comes first.
+- **Actively exploited issues.** If an issue is being exploited in the wild, either side may publish earlier after telling the other.
+- **Third-party components.** When the flaw is in a component we use, we also report it to the maintainers of that component, and we may agree a different date with them.
+- **What we publish.** The advisory names the repository, the affected version, the impact and the update. It does not name you unless you accepted credit.
+- **No bug bounty.** We do not pay for reports yet.
+
+## Testing in good faith
+
+We do not run a hosted service for this software, so test only against copies you run yourself. Do not access, change or keep data that is not yours. Do not degrade the services of third parties, such as GitHub or package registries, and do not use social engineering or physical attacks against people. If you reach data that is not yours, stop and report what you did. We will not take legal action against research that follows this policy.
+
+## Machine-readable contact
+
+The same contact is published as an RFC 9116 [security.txt](https://github.com/ipsofacto-io/.github/blob/main/.well-known/security.txt) in `ipsofacto-io/.github`. It is served at `https://ipsoplatform.io/.well-known/security.txt` once the site is live. Until then that file is the source. The file is not signed. Rely on the HTTPS address and the `Canonical` field.
 
 ## Support period and security updates
 
