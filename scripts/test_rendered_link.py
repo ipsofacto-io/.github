@@ -1,11 +1,19 @@
 """Tests for the SECURITY.md rendering check. No network: the HTTP opener and the sleep are replaced."""
+import contextlib
+import http.client
 import http.server
 import inspect
+import io
 import json
+import os
+import tempfile
 import threading
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import check_security_txt as cst
 
@@ -54,6 +62,62 @@ class CheckRendered(unittest.TestCase):
 
     def test_uppercase_tag_and_attribute(self):
         self.assertLinked(page(f'<A HREF="{CONTACT}">ipso</A>'))
+
+    def test_link_in_common_visible_elements(self):
+        for wrapper in ("p", "li", "td", "h2", "blockquote", "strong", "em", "code", "kbd", "div", "summary", "ul"):
+            with self.subTest(wrapper=wrapper):
+                self.assertLinked(f"<{wrapper}>{link('ipso')}</{wrapper}>")
+
+    def test_link_with_deeply_nested_visible_elements(self):
+        self.assertLinked(f"<blockquote><p><strong><em>{link('<code>ipso</code>')}</em></strong></p></blockquote>")
+
+    def test_void_elements_do_not_break_the_nesting(self):
+        self.assertLinked(page(link("ip<br>so")))
+        self.assertLinked(page(link('<img src="https://example.com/i.png" alt="x">ipso')))
+        self.assertLinked('<hr><p><img src="https://example.com/i.png" alt="x"> ' + link("ipso") + "</p>")
+
+    def test_stray_end_tags_are_ignored(self):
+        self.assertLinked(f'<p><a href="{CONTACT}">ipso</b></i></a></p>')
+
+    def test_ruby_base_text_is_visible(self):
+        self.assertLinked(page(link("<ruby>ipso<rp>(</rp><rt>x</rt><rp>)</rp></ruby>")))
+
+    def test_text_that_only_an_rp_element_holds_is_hidden(self):
+        self.assertNotLinked(page(link("<ruby><rp>ipso</rp></ruby>")))
+
+    def test_text_in_a_hidden_element_inside_the_anchor_is_not_counted(self):
+        for element in ("rp", "template", "style", "script", "svg", "datalist", "noembed", "canvas", "object", "title"):
+            with self.subTest(element=element):
+                self.assertNotLinked(page(link(f"<{element}>ipso</{element}>")))
+
+    def test_text_in_an_unknown_element_is_not_counted(self):
+        self.assertNotLinked(page(link("<made-up>ipso</made-up>")))
+
+    def test_hidden_text_does_not_count_but_visible_text_beside_it_does(self):
+        self.assertLinked(page(link("<rp>hidden</rp>shown")))
+
+    def test_an_anchor_inside_a_hidden_element_is_not_counted(self):
+        for element in ("rp", "template", "svg", "datalist", "noembed", "canvas", "object", "made-up"):
+            with self.subTest(element=element):
+                self.assertNotLinked(page(f"<{element}>{link('ipso')}</{element}>"))
+
+    def test_an_unclosed_hidden_element_inside_the_anchor_hides_the_rest(self):
+        self.assertNotLinked(f'<p><a href="{CONTACT}"><rp>ipso</a></p>')
+
+    def test_hangul_filler_characters_are_not_visible_text(self):
+        for code in (0x3164, 0xFFA0, 0x115F, 0x1160):
+            with self.subTest(code=hex(code)):
+                self.assertNotLinked(page(link(chr(code))))
+
+    def test_text_with_only_non_ascii_letters_is_not_counted(self):
+        self.assertNotLinked(page(link(E_GRAVE)))
+        self.assertNotLinked(page(link(chr(0x3B1))))
+
+    def test_text_with_an_ascii_letter_beside_non_ascii_ones_is_counted(self):
+        self.assertLinked(page(link(chr(0x3164) + "a")))
+
+    def test_ascii_digit_is_visible_text(self):
+        self.assertLinked(page(link("1")))
 
     def test_empty_page(self):
         self.assertNotLinked("")
@@ -223,6 +287,54 @@ class Render(unittest.TestCase):
         self.assertNotIn("SECRET-TOKEN-VALUE", str(caught.exception))
 
 
+class RenderRobustness(unittest.TestCase):
+    def render(self, opener, token=None):
+        return cst.render("x", "gfm", token, opener=opener, sleep=lambda seconds: None)
+
+    def test_retries_an_incomplete_read(self):
+        opener = FakeOpener(http.client.IncompleteRead(b"ab"), b"<p>ok</p>")
+        self.assertEqual(self.render(opener), "<p>ok</p>")
+
+    def test_retries_a_bad_status_line(self):
+        opener = FakeOpener(http.client.BadStatusLine("garbage"), b"<p>ok</p>")
+        self.assertEqual(self.render(opener), "<p>ok</p>")
+
+    def test_gives_up_on_a_connection_that_keeps_dropping(self):
+        opener = FakeOpener(*[http.client.IncompleteRead(b"ab")] * 3)
+        with self.assertRaises(cst.RenderError) as caught:
+            self.render(opener)
+        self.assertIn("IncompleteRead", str(caught.exception))
+        self.assertIn("3 attempt(s)", str(caught.exception))
+
+    def test_a_value_error_message_is_not_printed(self):
+        secret = "SECRET-TOKEN-VALUE"
+        opener = FakeOpener(*[ValueError(f"Invalid header value b'Bearer {secret}'")] * 3)
+        with self.assertRaises(cst.RenderError) as caught:
+            self.render(opener, token=secret)
+        self.assertIn("ValueError", str(caught.exception))
+        self.assertNotIn(secret, str(caught.exception))
+
+    def test_a_token_with_a_newline_is_refused_before_any_request(self):
+        opener = FakeOpener(b"<p>never used</p>")
+        with self.assertRaises(cst.RenderError) as caught:
+            self.render(opener, token="ghp_SECRET\n")
+        self.assertNotIn("ghp_SECRET", str(caught.exception))
+        self.assertEqual(opener.requests, [])
+
+    def test_tokens_with_a_space_or_non_ascii_character_are_refused(self):
+        for token in ("two words", "caf" + E_GRAVE, "tab\there", "cr\rtoken"):
+            with self.subTest(token=repr(token)):
+                opener = FakeOpener(b"<p>never used</p>")
+                with self.assertRaises(cst.RenderError):
+                    self.render(opener, token=token)
+                self.assertEqual(opener.requests, [])
+
+    def test_an_empty_token_sends_no_authorization_header(self):
+        opener = FakeOpener(b"<p>ok</p>")
+        self.render(opener, token="")
+        self.assertIsNone(opener.requests[0].get_header("Authorization"))
+
+
 class RenderLimits(unittest.TestCase):
     def test_a_response_over_the_size_limit_is_refused(self):
         opener = FakeOpener(b"a" * (cst.MAX_RESPONSE_BYTES + 1))
@@ -335,6 +447,83 @@ class CheckSecurityMd(unittest.TestCase):
         self.assertIn("gfm is down", errors[0])
         self.assertIn("(markdown)", errors[1])
         self.assertEqual([call[1] for call in self.calls], ["gfm", "markdown"])
+
+
+class Main(unittest.TestCase):
+    """main() on a temporary repository. check_security_md is replaced, so there is no network."""
+
+    def repo(self, security_txt="valid", security_md=b"# policy\n"):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        if security_txt == "valid":
+            expires = (datetime.now(timezone.utc) + timedelta(days=200)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            security_txt = (
+                f"Contact: {CONTACT}\nExpires: {expires}\nPreferred-Languages: en\n"
+                f"Canonical: {cst.CANONICAL}\nPolicy: {cst.POLICY}\n"
+            )
+        if security_txt is not None:
+            (root / ".well-known").mkdir()
+            (root / ".well-known" / "security.txt").write_bytes(security_txt.encode("ascii"))
+        if security_md is not None:
+            (root / "SECURITY.md").write_bytes(security_md)
+        return root
+
+    def main(self, root, environ=None, md_errors=()):
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(cst, "ROOT", root), unittest.mock.patch.object(
+            cst, "check_security_md", return_value=list(md_errors)
+        ) as check_md, unittest.mock.patch.dict(os.environ, environ or {}, clear=False), contextlib.redirect_stdout(
+            out
+        ), contextlib.redirect_stderr(err):
+            code = cst.main()
+        return code, out.getvalue(), err.getvalue(), check_md
+
+    def test_ok(self):
+        code, out, err, _ = self.main(self.repo())
+        self.assertEqual((code, out.strip(), err), (0, "security.txt: ok", ""))
+
+    def test_missing_security_txt_is_an_error_not_a_traceback(self):
+        code, _, err, check_md = self.main(self.repo(security_txt=None))
+        self.assertEqual(code, 1)
+        self.assertIn("cannot read .well-known/security.txt: FileNotFoundError", err)
+        check_md.assert_called_once()
+
+    def test_missing_security_md_is_an_error_not_a_traceback(self):
+        code, _, err, check_md = self.main(self.repo(security_md=None))
+        self.assertEqual(code, 1)
+        self.assertIn("cannot read SECURITY.md: FileNotFoundError", err)
+        check_md.assert_not_called()
+
+    def test_security_md_that_is_not_utf8_is_an_error_not_a_traceback(self):
+        code, _, err, check_md = self.main(self.repo(security_md=bytes([0x63, 0x61, 0x66, 0xE9])))
+        self.assertEqual(code, 1)
+        self.assertIn("cannot read SECURITY.md: UnicodeDecodeError", err)
+        check_md.assert_not_called()
+
+    def test_errors_from_the_rendering_check_fail_the_run(self):
+        code, out, err, _ = self.main(self.repo(), md_errors=["no link"])
+        self.assertEqual(code, 1)
+        self.assertIn("security.txt: no link", err)
+        self.assertEqual(out, "")
+
+    def test_errors_in_security_txt_fail_the_run(self):
+        code, _, err, _ = self.main(self.repo(security_txt="Contact: https://example.com\n"))
+        self.assertEqual(code, 1)
+        self.assertIn("Contact must be", err)
+
+    def test_the_token_is_stripped_and_passed_on(self):
+        _, _, _, check_md = self.main(self.repo(), environ={"GITHUB_TOKEN": "  abc123\n"})
+        self.assertEqual(check_md.call_args.args[1], "abc123")
+
+    def test_no_token_or_a_blank_token_is_passed_as_none(self):
+        for environ in ({"GITHUB_TOKEN": ""}, {"GITHUB_TOKEN": "  \n"}):
+            with self.subTest(environ=environ):
+                _, _, _, check_md = self.main(self.repo(), environ=environ)
+                self.assertIsNone(check_md.call_args.args[1])
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            _, _, _, check_md = self.main(self.repo())
+            self.assertIsNone(check_md.call_args.args[1])
 
 
 if __name__ == "__main__":

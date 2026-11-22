@@ -13,6 +13,7 @@ what the renderer shows. So the file is rendered by GitHub's own Markdown API, i
 rendering must contain a link to the Contact URL with visible text. That needs api.github.com. GITHUB_TOKEN, when
 set, is sent only there, to raise the rate limit. A failed call is retried and then fails the check.
 """
+import http.client
 import json
 import os
 import re
@@ -41,6 +42,14 @@ RETRY_DELAYS = (10, 30)  # seconds before the second and the third attempt
 RETRY_STATUS = {403, 429, 500, 502, 503, 504}  # a rate limit answers 403 or 429
 REQUEST_TIMEOUT = 15
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+# Elements whose text a browser shows. Text inside any other element does not count as visible: rp, template,
+# script, style, svg and an element this list does not know are all treated as hidden.
+VISIBLE_ELEMENTS = frozenset(
+    "a abbr address article aside b big blockquote caption center cite code dd del details dfn div dl dt em "
+    "figcaption figure font footer h1 h2 h3 h4 h5 h6 header i ins kbd li main mark nav ol p q ruby s samp section "
+    "small span strike strong sub summary sup table tbody td tfoot th thead tr tt u ul var".split()
+)
+VOID_ELEMENTS = frozenset("area base br col embed hr img input link meta param source track wbr".split())
 
 FIELD_LINE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*):[ ]+(\S.*)$")
 RFC3339 = re.compile(
@@ -165,6 +174,8 @@ def render(text, mode, token=None, opener=NO_REDIRECT_OPENER.open, sleep=time.sl
         "X-GitHub-Api-Version": "2022-11-28",
     }
     if token:
+        if not all("!" <= ch <= "~" for ch in token):
+            raise RenderError("GITHUB_TOKEN must be printable ASCII without spaces")
         headers["Authorization"] = "Bearer " + token
     problem = "no attempt was made"
     for attempt in range(ATTEMPTS):
@@ -181,28 +192,43 @@ def render(text, mode, token=None, opener=NO_REDIRECT_OPENER.open, sleep=time.sl
             problem = f"HTTP {error.code}"
             if error.code not in RETRY_STATUS:
                 break
-        except (OSError, ValueError) as error:  # a network error, a timeout, or a body that is not UTF-8
+        except OSError as error:  # a network error or a timeout; URLError and TLS errors are OSErrors
             problem = f"{type(error).__name__}: {str(error)[:200]}"
+        except (ValueError, http.client.HTTPException) as error:
+            # A body that is not UTF-8, a dropped connection or a malformed answer. Only the type is printed,
+            # because the text of a ValueError can quote a request header.
+            problem = type(error).__name__
     raise RenderError(f"GitHub's Markdown API failed in mode {mode} after {attempt + 1} attempt(s): {problem}")
 
 
 class _Anchors(HTMLParser):
-    """Collect the href and the text of every anchor in the rendered HTML."""
+    """Collect the href and the visible text of every anchor in the rendered HTML.
+
+    Text counts only when every open element is one a browser shows, so the text of an rp, a template or an svg
+    does not.
+    """
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.anchors = []
         self._open = None
+        self._stack = []
 
     def handle_starttag(self, tag, attrs):
+        if tag in VOID_ELEMENTS:
+            return
         if tag == "a":
             self._open = [dict(attrs).get("href"), []]
+        self._stack.append(tag)
 
     def handle_data(self, data):
-        if self._open is not None:
+        if self._open is not None and all(tag in VISIBLE_ELEMENTS for tag in self._stack):
             self._open[1].append(data)
 
     def handle_endtag(self, tag):
+        if tag not in self._stack:
+            return
+        del self._stack[len(self._stack) - 1 - self._stack[::-1].index(tag) :]
         if tag == "a" and self._open is not None:
             self.anchors.append((self._open[0], "".join(self._open[1])))
             self._open = None
@@ -213,9 +239,10 @@ def check_rendered(html, mode):
     parser = _Anchors()
     parser.feed(html)
     parser.close()
-    # Visible text has a letter or a digit. A zero-width space, a no-break space, an empty element or an image
-    # alone does not. GitHub's sanitizer removes hidden, style and class, so they cannot hide a link.
-    if any(href == CONTACT and any(ch.isalnum() for ch in text) for href, text in parser.anchors):
+    # Visible text has an ASCII letter or digit. Other letters can draw as blank space, such as the Hangul fillers,
+    # and so can a zero-width space, a no-break space, an empty element or an image alone. GitHub's sanitizer
+    # removes hidden, style and class, so they cannot hide a link.
+    if any(href == CONTACT and any(ch.isascii() and ch.isalnum() for ch in text) for href, text in parser.anchors):
         return []
     return [f"SECURITY.md rendered by GitHub ({mode}) has no link with visible text to the Contact URL: {CONTACT}"]
 
@@ -232,8 +259,17 @@ def check_security_md(security_md, token=None, renderer=render):
 
 
 def main():
-    errors = run(ROOT, datetime.now(timezone.utc))
-    errors += check_security_md((ROOT / "SECURITY.md").read_text(encoding="utf-8"), os.environ.get("GITHUB_TOKEN"))
+    errors = []
+    try:
+        errors += run(ROOT, datetime.now(timezone.utc))
+    except OSError as error:
+        errors.append(f"cannot read .well-known/security.txt: {type(error).__name__}")
+    try:
+        security_md = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        errors.append(f"cannot read SECURITY.md: {type(error).__name__}")
+    else:
+        errors += check_security_md(security_md, os.environ.get("GITHUB_TOKEN", "").strip() or None)
     for error in errors:
         print(f"security.txt: {error}", file=sys.stderr)
     if errors:
