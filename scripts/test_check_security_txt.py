@@ -194,7 +194,20 @@ class CheckSecurityTxt(unittest.TestCase):
         self.assertOneError(replace("# comment", "# comment\r\r"), "printable ASCII")
 
     def test_carriage_return_at_the_end_of_the_file_is_refused(self):
-        self.assertOneError(VALID + "# end\r", "printable ASCII")
+        errors = self.errors(VALID + "# end\r")
+        self.assertTrue(any("printable ASCII" in error for error in errors), errors)
+        self.assertTrue(any("last line must end" in error for error in errors), errors)
+
+    def test_last_line_must_end_in_lf(self):
+        self.assertOneError(VALID.rstrip("\n"), "last line must end")
+
+    def test_last_line_must_end_in_crlf_or_lf(self):
+        self.assertOneError(VALID.replace("\n", "\r\n").rstrip("\r\n"), "last line must end")
+
+    def test_empty_file_reports_the_missing_fields_not_a_line_end(self):
+        errors = self.errors("")
+        self.assertTrue(errors)
+        self.assertFalse(any("last line must end" in error for error in errors), errors)
 
     def test_http_canonical(self):
         text = replace(cst.CANONICAL, "http://ipsoplatform.io/.well-known/security.txt")
@@ -238,6 +251,10 @@ class RunThroughFiles(unittest.TestCase):
 
     def test_valid_file(self):
         self.assertEqual(self.run_with(VALID.encode("ascii")), [])
+
+    def test_file_without_a_final_line_end_is_refused(self):
+        errors = self.run_with(VALID.rstrip("\n").encode("ascii"))
+        self.assertTrue(any("last line must end" in error for error in errors), errors)
 
     def test_crlf_file_is_valid(self):
         self.assertEqual(self.run_with(VALID.replace("\n", "\r\n").encode("ascii")), [])
