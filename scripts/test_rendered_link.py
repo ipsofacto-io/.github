@@ -1,7 +1,11 @@
 """Tests for the SECURITY.md rendering check. No network: the HTTP opener and the sleep are replaced."""
+import http.server
+import inspect
 import json
+import threading
 import unittest
 import urllib.error
+import urllib.request
 
 import check_security_txt as cst
 
@@ -107,8 +111,8 @@ class FakeResponse:
     def __exit__(self, *exc):
         return False
 
-    def read(self):
-        return self.body
+    def read(self, size=-1):
+        return self.body if size < 0 else self.body[:size]
 
 
 class FakeOpener:
@@ -217,6 +221,79 @@ class Render(unittest.TestCase):
         with self.assertRaises(cst.RenderError) as caught:
             self.render(opener, token="SECRET-TOKEN-VALUE")
         self.assertNotIn("SECRET-TOKEN-VALUE", str(caught.exception))
+
+
+class RenderLimits(unittest.TestCase):
+    def test_a_response_over_the_size_limit_is_refused(self):
+        opener = FakeOpener(b"a" * (cst.MAX_RESPONSE_BYTES + 1))
+        with self.assertRaises(cst.RenderError) as caught:
+            cst.render("x", "gfm", None, opener=opener, sleep=lambda seconds: None)
+        self.assertIn("more than", str(caught.exception))
+
+    def test_a_response_at_the_size_limit_is_accepted(self):
+        opener = FakeOpener(b"a" * cst.MAX_RESPONSE_BYTES)
+        html = cst.render("x", "gfm", None, opener=opener, sleep=lambda seconds: None)
+        self.assertEqual(len(html), cst.MAX_RESPONSE_BYTES)
+
+
+class Redirects(unittest.TestCase):
+    """The default opener must not follow a redirect, which would forward the token to another host."""
+
+    def test_render_uses_the_opener_that_refuses_redirects_by_default(self):
+        default = inspect.signature(cst.render).parameters["opener"].default
+        self.assertEqual(default, cst.NO_REDIRECT_OPENER.open)
+
+    def test_the_handler_refuses_every_redirect(self):
+        handler = cst._NoRedirect()
+        request = urllib.request.Request("https://api.github.com/markdown", headers={"Authorization": "Bearer X"})
+        self.assertIsNone(handler.redirect_request(request, None, 302, "Found", {}, "https://example.com/"))
+
+    def test_a_real_redirect_is_not_followed_and_sends_no_second_request(self):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            # A 302 is the redirect that urllib follows for a POST: it sends a GET with the same Authorization.
+            def do_POST(self):
+                seen.append(("POST", self.path, self.headers.get("Authorization")))
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                self.send_response(302)
+                self.send_header("Location", "/elsewhere")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self):
+                seen.append(("GET", self.path, self.headers.get("Authorization")))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_address[1]}/markdown",
+                data=b"{}",
+                headers={"Authorization": "Bearer SECRET"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                cst.NO_REDIRECT_OPENER.open(request, timeout=5)
+            self.assertEqual(caught.exception.code, 302)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(seen, [("POST", "/markdown", "Bearer SECRET")])
+
+    def test_render_reports_a_redirect_as_an_error_without_retrying(self):
+        opener = FakeOpener(http_error(307), b"<p>never used</p>")
+        with self.assertRaises(cst.RenderError) as caught:
+            cst.render("x", "gfm", "T", opener=opener, sleep=lambda seconds: None)
+        self.assertIn("HTTP 307", str(caught.exception))
+        self.assertEqual(len(opener.requests), 1)
 
 
 class CheckSecurityMd(unittest.TestCase):

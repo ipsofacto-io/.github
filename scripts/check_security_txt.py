@@ -40,6 +40,7 @@ ATTEMPTS = 3
 RETRY_DELAYS = (10, 30)  # seconds before the second and the third attempt
 RETRY_STATUS = {403, 429, 500, 502, 503, 504}  # a rate limit answers 403 or 429
 REQUEST_TIMEOUT = 15
+MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 
 FIELD_LINE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*):[ ]+(\S.*)$")
 RFC3339 = re.compile(
@@ -144,7 +145,17 @@ class RenderError(Exception):
     """GitHub's Markdown API did not give a rendering."""
 
 
-def render(text, mode, token=None, opener=urllib.request.urlopen, sleep=time.sleep):
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects: urllib would send the Authorization header to the new host."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def render(text, mode, token=None, opener=NO_REDIRECT_OPENER.open, sleep=time.sleep):
     """Return the HTML that GitHub's Markdown API renders for text in the given mode."""
     body = json.dumps({"text": text, "mode": mode}).encode("utf-8")
     headers = {
@@ -162,7 +173,10 @@ def render(text, mode, token=None, opener=urllib.request.urlopen, sleep=time.sle
         request = urllib.request.Request(MARKDOWN_API, data=body, headers=headers, method="POST")
         try:
             with opener(request, timeout=REQUEST_TIMEOUT) as response:
-                return response.read().decode("utf-8")
+                data = response.read(MAX_RESPONSE_BYTES + 1)
+            if len(data) > MAX_RESPONSE_BYTES:
+                raise RenderError(f"GitHub's Markdown API answered with more than {MAX_RESPONSE_BYTES} bytes in mode {mode}")
+            return data.decode("utf-8")
         except urllib.error.HTTPError as error:
             problem = f"HTTP {error.code}"
             if error.code not in RETRY_STATUS:
