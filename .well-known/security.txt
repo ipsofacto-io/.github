@@ -1,0 +1,6 @@
+# Security contact for the ipsofacto-io repositories. Policy: coordinated vulnerability disclosure, 90-day window.
+Contact: https://github.com/ipsofacto-io/ipso/security/advisories/new
+Expires: 2027-11-20T23:00:00Z
+Preferred-Languages: en, it
+Canonical: https://ipsoplatform.io/.well-known/security.txt
+Policy: https://github.com/ipsofacto-io/.github/blob/main/SECURITY.md
