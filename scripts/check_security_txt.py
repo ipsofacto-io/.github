@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
-"""Check .well-known/security.txt (RFC 9116) against SECURITY.md.
+"""Check .well-known/security.txt (RFC 9116), and that SECURITY.md shows the same contact.
 
 Run from anywhere: the files are read relative to the repository root.
-The file is read as bytes, so no newline translation happens. Every line must be printable ASCII
-(space to tilde) and end in LF or CRLF, comments included, because parsers disagree on which
+
+security.txt is checked offline. It is read as bytes, so no newline translation happens. Every line must be
+printable ASCII (space to tilde) and end in LF or CRLF, comments included, because parsers disagree on which
 characters end a line, and a comment must not be able to hide a field from one of them.
-SECURITY.md must contain a Markdown link, with visible text, to the Contact URL. link_targets()
-follows the CommonMark rules for code blocks, code spans and HTML. It fails closed: a form it does
-not understand, such as a reference-style link or a bare URL, does not count as a link.
 The weekly workflow fails when Expires is less than 30 days away, so a person renews the file in time.
+
+SECURITY.md is not parsed here. A hand-written Markdown parser disagrees with the renderer, and what readers see is
+what the renderer shows. So the file is rendered by GitHub's own Markdown API, in both of its modes, and each
+rendering must contain a link to the Contact URL with visible text. That needs api.github.com. GITHUB_TOKEN, when
+set, is sent only there, to raise the rate limit. A failed call is retried and then fails the check.
 """
+import json
+import os
 import re
 import sys
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -25,209 +34,19 @@ POLICY = "https://github.com/ipsofacto-io/.github/blob/main/SECURITY.md"
 MIN_DAYS = 30
 MAX_DAYS = 366
 
-FIELD_LINE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*):[ ]+(\S.*?)[ ]*$")
+MARKDOWN_API = "https://api.github.com/markdown"
+MARKDOWN_MODES = ("gfm", "markdown")
+ATTEMPTS = 3
+RETRY_DELAYS = (10, 30)  # seconds before the second and the third attempt
+RETRY_STATUS = {403, 429, 500, 502, 503, 504}  # a rate limit answers 403 or 429
+REQUEST_TIMEOUT = 15
+
+FIELD_LINE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*):[ ]+(\S.*)$")
 RFC3339 = re.compile(
     r"^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?([Zz]|[+-]\d{2}:\d{2})$",
     re.ASCII,
 )
 LANGUAGE_TAG = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$")
-# Markdown. A container prefix is any blockquote markers and one list marker.
-QUOTE = re.compile(r"[ ]{0,3}>[ ]?")
-LIST_MARKER = re.compile(r"[ ]*(?:[-*+]|\d{1,9}[.)])[ ]")
-FENCE_OPEN = re.compile(r"^[ ]*(`{3,}|~{3,})(.*)$")
-HEADING = re.compile(r"^[ ]{0,3}#{1,6}(?:[ ]|$)")
-SETEXT_UNDERLINE = re.compile(r"^[ ]{0,3}(?:=+|-+)[ ]*$")
-THEMATIC_BREAK = re.compile(r"^[ ]{0,3}([-*_])(?:[ ]*\1){2,}[ ]*$")
-HTML_RAW = re.compile(r"^[ ]{0,3}<(script|pre|style|textarea)(?:[ \t>]|$)", re.I)
-HTML_SPECIAL = re.compile(r"^[ ]{0,3}(<\?|<!\[CDATA\[|<![A-Za-z])")
-HTML_SPECIAL_END = {"<?": "?>", "<![CDATA[": "]]>"}
-HTML_BLOCK_TAG = re.compile(
-    r"^[ ]{0,3}</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details"
-    r"|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html"
-    r"|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary"
-    r"|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:[ \t/>]|$)",
-    re.I,
-)
-# A complete open or closing tag alone on its line.
-HTML_LONE_TAG = re.compile(
-    r"^[ ]{0,3}(?:<[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*"
-    r"(?:[ \t]*=[ \t]*(?:[^ \t\"'=<>`]+|'[^']*'|\"[^\"]*\"))?)*[ \t]*/?>|</[A-Za-z][A-Za-z0-9-]*[ \t]*>)[ \t]*$"
-)
-# A link needs text with something visible in it. Images and escaped brackets are not links.
-LINK = re.compile(r"(?<![!\\])\[([^\[\]]*)\]\((https://[^\s)]+)(?:[ ]+\"[^\"]*\")?\)")
-
-
-def _strip_inline(text):
-    """Remove what does not render as link text: code spans and HTML comments."""
-    out = []
-    i = 0
-    size = len(text)
-    while i < size:
-        ch = text[i]
-        if ch == "\\" and i + 1 < size:
-            out.append(text[i : i + 2])
-            i += 2
-        elif ch == "`":
-            j = i
-            while j < size and text[j] == "`":
-                j += 1
-            run = j - i
-            close = None
-            k = j
-            while k < size:
-                s = text.find("`", k)
-                if s == -1:
-                    break
-                e = s
-                while e < size and text[e] == "`":
-                    e += 1
-                if e - s == run:
-                    close = e
-                    break
-                k = e
-            if close is None:
-                out.append(text[i:j])
-                i = j
-            else:
-                out.append("X")  # the span renders as code, which is still link text
-                i = close
-        elif text.startswith("<!--", i) and text.find("-->", i + 4) != -1:
-            i = text.find("-->", i + 4) + 3
-        else:
-            out.append(ch)
-            i += 1
-    return "".join(out)
-
-
-def _split_quotes(line, limit=None):
-    """Return (blockquote markers at the start of the line, how many, the rest).
-
-    This is a loop, not a repeated regex group: the group would be ambiguous about which iteration owns a space,
-    and a line of nested markers would then backtrack exponentially.
-    """
-    pos = depth = 0
-    while limit is None or depth < limit:
-        match = QUOTE.match(line, pos)
-        if not match:
-            break
-        pos, depth = match.end(), depth + 1
-    return line[:pos], depth, line[pos:]
-
-
-def _html_block_end(body):
-    """Return what ends the HTML block that starts on this line, or None if none starts here.
-
-    "" means the next blank line. A lone tag always starts a block here, even after a paragraph:
-    CommonMark lets it start one when the paragraph belongs to a deeper container, so this is the safe side.
-    """
-    raw = HTML_RAW.match(body)
-    if raw:
-        return "</%s>" % raw.group(1).lower()
-    special = HTML_SPECIAL.match(body)
-    if special:
-        return HTML_SPECIAL_END.get(special.group(1), ">")
-    if body.lstrip(" ").startswith("<!--") and len(body) - len(body.lstrip(" ")) < 4:
-        return "-->"
-    if HTML_BLOCK_TAG.match(body) or HTML_LONE_TAG.match(body):
-        return ""
-    return None
-
-
-def _paragraphs(markdown):
-    """Return the blocks of lines whose Markdown renders: not code, not an HTML block.
-
-    An HTML comment or a raw-text block that its blockquote or list item cuts off before its end marker is left
-    unterminated in the rendered page, which then swallows what follows. That case drops the rest of the document.
-    """
-    blocks = []
-    block = []
-
-    def flush():
-        nonlocal block
-        if block:
-            blocks.append("\n".join(block))
-            block = []
-
-    fence = None  # (character, length, quote depth, list indent) while inside a fenced code block
-    html = None  # (end marker, quote depth, list indent) while inside an HTML block
-    previous = "blank"  # blank, text, heading or code
-    for raw in markdown.split("\n"):
-        line = raw[:-1] if raw.endswith("\r") else raw
-        _, depth, rest = _split_quotes(line)
-        after = rest.replace("\t", "    ")
-        indent = len(after) - len(after.lstrip(" "))
-        marker = LIST_MARKER.match(rest)
-        body = rest[marker.end() :] if marker else rest
-        blank = not body.strip()
-        list_indent = len(after) - len(body.replace("\t", "    ")) if marker else 0
-        if fence:
-            if not blank and (depth < fence[2] or indent < fence[3]):
-                fence = None  # the blockquote or the list item that held the fence ended
-            else:
-                closing = re.escape(fence[0]) + "{%d,}[ ]*$" % fence[1]
-                if depth == fence[2] and 0 <= indent - fence[3] <= 3 and re.match(closing, after.lstrip(" ")):
-                    fence = None
-                continue
-        if html:
-            # Quote markers deeper than the block's own are raw content, so they do not make a line blank.
-            inside = _split_quotes(line, html[1])[2]
-            inside_blank = not inside.strip()
-            if not inside_blank and (depth < html[1] or indent < html[2]):
-                if html[0] and html[0] != "</pre>":
-                    break  # cut off before its end marker: the rest of the page is swallowed
-                html = None
-            elif html[0] == "" and inside_blank:
-                html = None
-            elif html[0] and html[0] in line.lower():
-                html = None
-                continue
-            else:
-                continue
-        if blank:
-            flush()
-            previous = "blank"
-            continue
-        if previous != "text" and (indent >= 4 or body.startswith("    ") or body.startswith("\t")):
-            previous = "code"
-            continue
-        opener = FENCE_OPEN.match(body)
-        if opener and not (opener.group(1)[0] == "`" and "`" in opener.group(2)):
-            flush()
-            fence = (opener.group(1)[0], len(opener.group(1)), depth, list_indent)
-            previous = "code"
-            continue
-        end_tag = _html_block_end(body)
-        if end_tag is not None:
-            flush()
-            start = body.lower().index("<!--") + 4 if end_tag == "-->" else 0
-            if not (end_tag and end_tag in body.lower()[start:]):
-                html = (end_tag, depth, list_indent)
-            previous = "code"
-            continue
-        if previous == "text" and SETEXT_UNDERLINE.match(body):
-            flush()
-            previous = "heading"
-            continue
-        if THEMATIC_BREAK.match(body):
-            flush()
-            previous = "heading"
-            continue
-        if marker or HEADING.match(body):
-            flush()
-        block.append(body)
-        previous = "heading" if HEADING.match(body) else "text"
-        if previous == "heading":
-            flush()
-    flush()
-    return blocks
-
-
-def link_targets(markdown):
-    """Return the URLs of the Markdown links that render with visible text."""
-    targets = set()
-    for paragraph in _paragraphs(markdown):
-        targets.update(url for text, url in LINK.findall(_strip_inline(paragraph)) if text.strip())
-    return targets
 
 
 def parse_expires(value):
@@ -253,8 +72,8 @@ def parse_expires(value):
         return None
 
 
-def check(text, security_md, now):
-    """Return a list of problems. An empty list means the file is valid."""
+def check(text, now):
+    """Return a list of problems with the text of security.txt. An empty list means it is valid."""
     errors = []
     values = {}
     segments = text.split("\n")
@@ -274,14 +93,13 @@ def check(text, security_md, now):
         if name not in FIELDS:
             errors.append(f"line {number}: field {match.group(1)} is not allowed in this file")
             continue
-        values.setdefault(name, []).append(match.group(2))
+        values.setdefault(name, []).append(match.group(2).rstrip(" "))
 
     if text and not text.endswith("\n"):
         errors.append("the last line must end in LF or CRLF")
+
     if values.get("contact", []) != [CONTACT]:
         errors.append(f"Contact must be exactly one line: {CONTACT}")
-    elif CONTACT not in link_targets(security_md):
-        errors.append(f"SECURITY.md does not link to the Contact URL: {CONTACT}")
 
     expires = values.get("expires", [])
     if len(expires) != 1:
@@ -319,13 +137,89 @@ def read_security_txt(path):
 
 
 def run(root, now):
-    text = read_security_txt(Path(root) / ".well-known" / "security.txt")
-    security_md = (Path(root) / "SECURITY.md").read_text(encoding="utf-8")
-    return check(text, security_md, now)
+    return check(read_security_txt(Path(root) / ".well-known" / "security.txt"), now)
+
+
+class RenderError(Exception):
+    """GitHub's Markdown API did not give a rendering."""
+
+
+def render(text, mode, token=None, opener=urllib.request.urlopen, sleep=time.sleep):
+    """Return the HTML that GitHub's Markdown API renders for text in the given mode."""
+    body = json.dumps({"text": text, "mode": mode}).encode("utf-8")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "User-Agent": "security-txt-check",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    problem = "no attempt was made"
+    for attempt in range(ATTEMPTS):
+        if attempt:
+            sleep(RETRY_DELAYS[attempt - 1])
+        request = urllib.request.Request(MARKDOWN_API, data=body, headers=headers, method="POST")
+        try:
+            with opener(request, timeout=REQUEST_TIMEOUT) as response:
+                return response.read().decode("utf-8")
+        except urllib.error.HTTPError as error:
+            problem = f"HTTP {error.code}"
+            if error.code not in RETRY_STATUS:
+                break
+        except (OSError, ValueError) as error:  # a network error, a timeout, or a body that is not UTF-8
+            problem = f"{type(error).__name__}: {str(error)[:200]}"
+    raise RenderError(f"GitHub's Markdown API failed in mode {mode} after {attempt + 1} attempt(s): {problem}")
+
+
+class _Anchors(HTMLParser):
+    """Collect the href and the text of every anchor in the rendered HTML."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.anchors = []
+        self._open = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self._open = [dict(attrs).get("href"), []]
+
+    def handle_data(self, data):
+        if self._open is not None:
+            self._open[1].append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._open is not None:
+            self.anchors.append((self._open[0], "".join(self._open[1])))
+            self._open = None
+
+
+def check_rendered(html, mode):
+    """Return a list of problems with GitHub's rendering of SECURITY.md in one mode."""
+    parser = _Anchors()
+    parser.feed(html)
+    parser.close()
+    # Visible text has a letter or a digit. A zero-width space, a no-break space, an empty element or an image
+    # alone does not. GitHub's sanitizer removes hidden, style and class, so they cannot hide a link.
+    if any(href == CONTACT and any(ch.isalnum() for ch in text) for href, text in parser.anchors):
+        return []
+    return [f"SECURITY.md rendered by GitHub ({mode}) has no link with visible text to the Contact URL: {CONTACT}"]
+
+
+def check_security_md(security_md, token=None, renderer=render):
+    """Return a list of problems with how GitHub renders SECURITY.md. Every mode must show the link."""
+    errors = []
+    for mode in MARKDOWN_MODES:
+        try:
+            errors += check_rendered(renderer(security_md, mode, token), mode)
+        except RenderError as error:
+            errors.append(str(error))
+    return errors
 
 
 def main():
     errors = run(ROOT, datetime.now(timezone.utc))
+    errors += check_security_md((ROOT / "SECURITY.md").read_text(encoding="utf-8"), os.environ.get("GITHUB_TOKEN"))
     for error in errors:
         print(f"security.txt: {error}", file=sys.stderr)
     if errors:

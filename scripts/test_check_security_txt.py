@@ -1,3 +1,4 @@
+import signal
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -7,7 +8,6 @@ import check_security_txt as cst
 
 NOW = datetime(2026, 11, 21, 12, 0, tzinfo=timezone.utc)
 CONTACT = cst.CONTACT
-SECURITY_MD = f"Report it in [ipso]({CONTACT}).\n"
 VALID = "\n".join(
     [
         "# comment",
@@ -33,11 +33,11 @@ def replace(old, new):
 
 
 class CheckSecurityTxt(unittest.TestCase):
-    def errors(self, text, security_md=SECURITY_MD):
-        return cst.check(text, security_md, NOW)
+    def errors(self, text):
+        return cst.check(text, NOW)
 
-    def assertOneError(self, text, fragment, security_md=SECURITY_MD):
-        errors = self.errors(text, security_md)
+    def assertOneError(self, text, fragment):
+        errors = self.errors(text)
         self.assertEqual(len(errors), 1, errors)
         self.assertIn(fragment, errors[0])
 
@@ -56,56 +56,6 @@ class CheckSecurityTxt(unittest.TestCase):
 
     def test_second_contact(self):
         self.assertOneError(VALID + "Contact: mailto:security@ipsoplatform.io\n", "Contact must be")
-
-    def test_contact_not_in_security_md(self):
-        self.assertOneError(VALID, "SECURITY.md does not link to", security_md="no contact here\n")
-
-    def test_contact_url_prefix_in_security_md_is_not_enough(self):
-        self.assertOneError(VALID, "SECURITY.md does not link to", security_md=f"see [x]({CONTACT}/extra)\n")
-
-    def test_contact_only_in_backticks_is_not_a_link(self):
-        self.assertOneError(VALID, "SECURITY.md does not link to", security_md=f"use `{CONTACT}` to report\n")
-
-    def test_contact_as_bare_text_is_not_a_link(self):
-        self.assertOneError(VALID, "SECURITY.md does not link to", security_md=f"report at {CONTACT}\n")
-
-    def test_contact_as_link_text_with_another_target(self):
-        self.assertOneError(
-            VALID, "SECURITY.md does not link to", security_md=f"[{CONTACT}](https://attacker.example/report)\n"
-        )
-
-    def test_contact_link_inside_html_comment_does_not_count(self):
-        self.assertOneError(VALID, "SECURITY.md does not link to", security_md=f"<!-- [x]({CONTACT}) -->\n")
-
-    def test_contact_link_inside_unclosed_html_comment_does_not_count(self):
-        self.assertOneError(VALID, "SECURITY.md does not link to", security_md=f"<!-- [x]({CONTACT})\n")
-
-    def test_contact_link_inside_code_span_does_not_count(self):
-        self.assertOneError(VALID, "SECURITY.md does not link to", security_md=f"`[x]({CONTACT})`\n")
-
-    def test_contact_link_inside_double_backtick_span_does_not_count(self):
-        self.assertOneError(VALID, "SECURITY.md does not link to", security_md=f"``[x]({CONTACT})``\n")
-
-    def test_contact_link_inside_fenced_block_does_not_count(self):
-        for fence in ("```", "~~~"):
-            with self.subTest(fence=fence):
-                md = f"{fence}sh\n[x]({CONTACT})\n{fence}\n"
-                self.assertOneError(VALID, "SECURITY.md does not link to", security_md=md)
-
-    def test_contact_link_inside_unclosed_fence_does_not_count(self):
-        self.assertOneError(VALID, "SECURITY.md does not link to", security_md=f"```\n[x]({CONTACT})\n")
-
-    def test_link_after_a_code_block_still_counts(self):
-        md = f"```sh\necho hi\n```\n\nReport in [ipso]({CONTACT}).\n"
-        self.assertEqual(self.errors(VALID, security_md=md), [])
-
-    def test_link_after_a_comment_still_counts(self):
-        md = f"<!-- note -->\nReport in [ipso]({CONTACT}).\n"
-        self.assertEqual(self.errors(VALID, security_md=md), [])
-
-    def test_link_between_two_code_spans_still_counts(self):
-        md = f"`a` then [ipso]({CONTACT}) then `b`\n"
-        self.assertEqual(self.errors(VALID, security_md=md), [])
 
     def test_missing_expires(self):
         self.assertOneError(replace("Expires: 2027-11-20T23:00:00Z\n", ""), "exactly one Expires")
@@ -230,6 +180,9 @@ class CheckSecurityTxt(unittest.TestCase):
     def test_invalid_language_tag(self):
         self.assertOneError(replace("en, it", "en, not a tag"), "invalid tag")
 
+    def test_trailing_spaces_on_a_value_are_ignored(self):
+        self.assertEqual(self.errors(replace("2027-11-20T23:00:00Z", "2027-11-20T23:00:00Z   ")), [])
+
     def test_field_names_are_case_insensitive(self):
         self.assertEqual(self.errors(replace("Contact:", "contact:")), [])
 
@@ -237,12 +190,11 @@ class CheckSecurityTxt(unittest.TestCase):
 class RunThroughFiles(unittest.TestCase):
     """Go through run(), which reads the file as bytes, as main() does."""
 
-    def run_with(self, content, security_md=SECURITY_MD):
+    def run_with(self, content):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / ".well-known").mkdir()
             (root / ".well-known" / "security.txt").write_bytes(content)
-            (root / "SECURITY.md").write_text(security_md, encoding="utf-8")
             return cst.run(root, NOW)
 
     def assertRefused(self, content):
@@ -273,6 +225,35 @@ class RunThroughFiles(unittest.TestCase):
 
     def test_line_separator_bytes_are_refused(self):
         self.assertRefused(replace("# comment", "# comment" + chr(0x2028)).encode("utf-8"))
+
+
+class PathologicalInput(unittest.TestCase):
+    """A crafted security.txt must not make the check slow. SIGALRM is missing on Windows, so skip it there."""
+
+    @unittest.skipUnless(hasattr(signal, "SIGALRM"), "needs SIGALRM")
+    def test_inputs_finish_quickly(self):
+        def too_slow(signum, frame):
+            raise AssertionError("check() took more than 20 seconds")
+
+        cases = {
+            "long run of spaces inside a value": "Contact: x" + " " * 200000 + "y\n",
+            "long run of trailing spaces": "Contact: " + CONTACT + " " * 200000 + "\n",
+            "very long line": "# " + "a" * 1000000 + "\n",
+            "many short lines": "# c\n" * 200000,
+            "many fields": "Preferred-Languages: en\n" * 100000,
+            "long language list": "Preferred-Languages: " + ",".join(["en"] * 100000) + "\n",
+        }
+        previous = signal.signal(signal.SIGALRM, too_slow)
+        try:
+            for name, text in cases.items():
+                with self.subTest(name=name):
+                    signal.alarm(20)
+                    try:
+                        cst.check(text, NOW)
+                    finally:
+                        signal.alarm(0)
+        finally:
+            signal.signal(signal.SIGALRM, previous)
 
 
 if __name__ == "__main__":

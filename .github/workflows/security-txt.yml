@@ -24,5 +24,9 @@ jobs:
           persist-credentials: false
       - name: Unit tests
         run: python3 -m unittest discover -s scripts -v
-      - name: Check security.txt
+      - name: Check security.txt and how GitHub renders SECURITY.md
+        # The token is read-only (contents: read) on a public repository. The script sends it only to
+        # api.github.com, to raise the rate limit of the Markdown API.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/check_security_txt.py
