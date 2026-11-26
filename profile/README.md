@@ -5,7 +5,7 @@
 
 **A registry of binding engineering decisions, enforced on pull requests, in CI, on infrastructure plans, and before AI coding agents edit code.**
 
-> Status: pre-alpha. The open EDR 1.1 specification, CLI, GitHub Action, agent plugins, examples, and source-available control plane are actively developed ahead of the 1.0 release.
+> Status: pre-alpha. The EDR 1.1 specification is stable; the CLI, GitHub Action, agent plugins, examples, and source-available control plane are actively developed ahead of the ipso 1.0 product release.
 
 ## Why ipso
 
