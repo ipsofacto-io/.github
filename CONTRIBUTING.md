@@ -1,6 +1,6 @@
 # Contributing to ipso
 
-Thanks for your interest in ipso. The project is pre-alpha: most repositories are still empty, and the first code lands with the initial open source release. Until then, the most useful contributions are discussions and issues.
+Thanks for your interest in ipso. The project is pre-alpha and actively developed ahead of the ipso 1.0 release. Discussions, issues, and pull requests are welcome.
 
 ## Before you start
 
